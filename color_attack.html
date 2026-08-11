@@ -1,0 +1,177 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>Color Attacker</title>
+<style>
+  body { font-family: system-ui, Arial, sans-serif; margin:20px; max-width:900px; }
+  label { margin-right:12px; }
+  button { margin:6px; }
+  pre { background:#f6f6f6; padding:8px; border-radius:6px; height:140px; overflow:auto; }
+  table { width:100%; border-collapse:collapse; margin-top:12px; }
+  th, td { padding:6px; border:1px solid #ddd; text-align:left; }
+  .sw { width:20px; height:14px; display:inline-block; border:1px solid #000; vertical-align:middle; }
+  select.colorSelect { padding:6px; border-radius:4px; border:1px solid #ccc; }
+</style>
+</head>
+<body>
+<h2>Color Attacker</h2>
+
+<label>Size: <input id="dim" type="number" value="128" min="32" max="512"></label>
+<label>Trials: <input id="trials" type="number" value="300" min="50"></label>
+<label>Warmup: <input id="warmup" type="number" value="150" min="0"></label>
+<br><br>
+
+<label>Secret color:
+  <select id="secretColor" class="colorSelect"></select>
+</label>
+
+<br><br>
+<button id="create">Create secret</button>
+<button id="run">Run attack</button>
+<button id="download" disabled>Download CSV</button>
+
+<pre id="log"></pre>
+<div id="tableArea"></div>
+
+<script>
+const logEl = document.getElementById('log');
+function log(...a){ logEl.textContent += a.join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+function mean(arr){ return arr.reduce((s,x)=>s+x,0)/arr.length; }
+function csvFromRows(rows){ return rows.map(r=> r.map(x=> typeof x==='string' && x.includes(',') ? `"${x.replace(/"/g,'""')}"` : x).join(',')).join('\n'); }
+function download(name, text){ const b=new Blob([text],{type:'text/csv'}); const u=URL.createObjectURL(b); const a=document.createElement('a'); a.href=u; a.download=name; a.click(); URL.revokeObjectURL(u); }
+
+function rgbToHex(r,g,b){ return '#' + [r,g,b].map(v=>v.toString(16).padStart(2,'0')).join(''); }
+function hexToRgb(hex){ const n = parseInt(hex.replace('#',''),16); return {r:(n>>16)&255, g:(n>>8)&255, b:n&255}; }
+
+const WEBSAFE = (function gen(){
+  const steps = [0,128,255], out=[];
+  for (const r of steps) for (const g of steps) for (const b of steps) out.push({r,g,b});
+  return out;
+})();
+
+function fillSecretSelect(){
+  const sel = document.getElementById('secretColor');
+  sel.innerHTML = '';
+  for (const c of WEBSAFE){
+    const hex = rgbToHex(c.r,c.g,c.b);
+    const opt = document.createElement('option');
+    opt.value = hex;
+    opt.textContent = hex;
+    sel.appendChild(opt);
+  }
+  function updateSelectSwatch(){
+    sel.style.background = sel.value;
+    const {r,g,b} = hexToRgb(sel.value);
+    const lum = 0.299*r + 0.587*g + 0.114*b;
+    sel.style.color = lum < 140 ? '#fff' : '#000';
+  }
+  sel.addEventListener('change', updateSelectSwatch);
+  updateSelectSwatch();
+}
+fillSecretSelect();
+
+function makeSolid(size,r,g,b){
+  const N = size*size*4;
+  const arr = new Uint8Array(N);
+  for (let i=0;i<N;i+=4){ arr[i]=r; arr[i+1]=g; arr[i+2]=b; arr[i+3]=255; }
+  return arr;
+}
+
+function naiveCompare(a, b){
+  if (a.length !== b.length) return false;
+  const L = a.length;
+  for (let i=0;i<L;i++){
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function constantCompare(a, b){
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  const L = a.length;
+  for (let i=0;i<L;i++){
+    diff |= (a[i] ^ b[i]);
+  }
+  return diff === 0;
+}
+
+function measureSync(fn,arg,trials=200,warmup=100){
+  for (let i=0;i<warmup;i++) fn(arg);
+  const out = [];
+  for (let t=0;t<trials;t++){
+    const a = performance.now();
+    fn(arg);
+    const b = performance.now();
+    out.push(b-a);
+  }
+  return out;
+}
+
+let SECRET = null;
+let CSV = null;
+
+document.getElementById('create').addEventListener('click', ()=>{
+  const size = +document.getElementById('dim').value;
+  const hex = document.getElementById('secretColor').value;
+  const {r,g,b} = hexToRgb(hex);
+  SECRET = makeSolid(size,r,g,b);
+  log(`Secret created: ${hex} (${size}x${size})`);
+  document.getElementById('download').disabled = true;
+  document.getElementById('tableArea').innerHTML = '';
+});
+
+document.getElementById('run').addEventListener('click', async ()=>{
+  if (!SECRET){ log('Create secret first'); return; }
+  logEl.textContent = '';
+  const size = +document.getElementById('dim').value;
+  const trials = +document.getElementById('trials').value;
+  const warmup = +document.getElementById('warmup').value;
+  const pals = WEBSAFE;
+  log(`Testing ${pals.length} web-safe candidates (trials=${trials}, warmup=${warmup})`);
+  const rows = [['hex','rgb','mean_ms','stdev_ms','exact']];
+  const results = [];
+  for (let i=0;i<pals.length;i++){
+    const c = pals[i];
+    const cand = makeSolid(size,c.r,c.g,c.b);
+    const times = measureSync(([_a,_b])=>naiveCompare(_a,_b), [SECRET,cand], trials, warmup);
+    const m = mean(times);
+    const sd = Math.sqrt(times.reduce((s,x)=>s+(x-m)*(x-m),0)/times.length);
+    const exact = constantCompare(SECRET,cand);
+    const hex = rgbToHex(c.r,c.g,c.b);
+    rows.push([hex,`${c.r} ${c.g} ${c.b}`, m.toFixed(6), sd.toFixed(6), exact ? 'true' : 'false']);
+    results.push({hex,mean:m,sd,exact});
+    if (i%8===0) log(`tested ${i+1}/${pals.length}...`);
+    await new Promise(r=>setTimeout(r,0));
+  }
+  results.sort((a,b)=>b.mean-a.mean);
+  const winner = results[0];
+  log(`Done. Guessed: ${winner.hex} (mean ${winner.mean.toFixed(6)} ms)`);
+  const t = document.createElement('table');
+  t.innerHTML = '<tr><th>Candidate</th><th>Swatch</th><th>Mean (ms)</th><th>StdDev (ms)</th><th>Exact</th></tr>';
+  for (const r of results){
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td style="font-family:monospace">${r.hex}</td>
+                    <td><span class="sw" style="background:${r.hex}"></span></td>
+                    <td>${r.mean.toFixed(6)}</td>
+                    <td>${r.sd ? r.sd.toFixed(6) : ''}</td>
+                    <td>${r.exact ? 'X' : ''}</td>`;
+    if (r.hex===winner.hex) tr.style.fontWeight='700';
+    t.appendChild(tr);
+  }
+  document.getElementById('tableArea').innerHTML = '';
+  document.getElementById('tableArea').appendChild(t);
+  CSV = rows;
+  document.getElementById('download').disabled = false;
+});
+
+document.getElementById('download').addEventListener('click', ()=>{
+  if (!CSV) return;
+  download('color_results.csv', csvFromRows(CSV));
+});
+</script>
+</body>
+</html>

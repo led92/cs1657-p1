@@ -1,0 +1,157 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Image Comparison</title>
+<style>
+  body { font-family: system-ui, Arial, sans-serif; margin: 24px; max-width: 900px; }
+  label { display: inline-block; margin: 6px 12px 6px 0; }
+  button { margin: 8px 8px 8px 0; }
+  code, pre { background: #f6f6f6; padding: 8px; border-radius: 6px; }
+  .row { margin: 8px 0; }
+</style>
+</head>
+<body>
+<h2>Image Comparison</h2>
+<p>This page generates a random base image, creates variants with different similarity levels, and compares them using two algorithms:</p>
+<ul>
+  <li><b>NaïveCompare</b>: exits at first mismatch (expected timing leak).</li>
+  <li><b>ConstantCompare</b>: scans all bytes (mitigation).</li>
+</ul>
+
+<div class="row">
+  <label>Image size (pixels): <input id="dim" type="number" value="128" min="32" max="512"></label>
+  <label>Trials per condition: <input id="trials" type="number" value="600" min="50"></label>
+  <label>Warmup iterations: <input id="warmup" type="number" value="300" min="0"></label>
+</div>
+<div class="row">
+  <label>Similarity levels (% comma-separated): <input id="levels" type="text" value="0,25,50,75,100" size="24"></label>
+</div>
+<div class="row">
+  <label><input id="jitterOn" type="checkbox"> Add random jitter to NaïveCompare (noise)</label>
+  <label>Jitter per-step (0..10): <input id="jitterMag" type="number" value="0" min="0" max="10"></label>
+</div>
+
+<div class="row">
+  <button id="run">Run experiment</button>
+  <button id="download" disabled>Download CSV</button>
+</div>
+
+<pre id="log" style="height: 220px; overflow:auto;"></pre>
+
+<script>
+const logEl = document.getElementById('log');
+function log(...args){ logEl.textContent += args.join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+function mean(a){ return a.reduce((x,y)=>x+y,0)/a.length; }
+function toCSV(rows){ return rows.map(r => r.map(x => (typeof x === 'string' && x.includes(',')) ? `"${x.replaceAll('"','""')}"` : x).join(',')).join('\n'); }
+function download(name, text){
+  const blob = new Blob([text], {type:'text/csv'}), url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = name; a.click(); URL.revokeObjectURL(url);
+}
+
+function makeRandomImageBytes(size){
+  const N = size*size*4;
+  const arr = new Uint8Array(N);
+  crypto.getRandomValues(arr);
+  for (let i=3;i<N;i+=4) arr[i] = 255;
+  return arr;
+}
+
+function makeVariant(baseBytes, similarityPct){
+  const out = new Uint8Array(baseBytes.length);
+  out.set(baseBytes);
+  const N = baseBytes.length;
+  const keep = Math.round((similarityPct/100) * N);
+  for (let i = keep; i < N; i++){
+    out[i] = baseBytes[i] ^ 0xFF;
+  }
+  return out;
+}
+
+function naiveCompare(a, b, jitterMag=0){
+  if (a.length !== b.length) return false;
+  const L = a.length;
+  for (let i=0;i<L;i++){
+    if (a[i] !== b[i]) {
+      if (jitterMag>0){
+        let d=0; for (let k=0;k<jitterMag;k++){ d = (d^((i+k)*2654435761))>>>0; }
+        if (d===-1) console.log('');
+      }
+      return false;
+    }
+  }
+  return true;
+}
+function constantCompare(a, b){
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  const L = a.length;
+  for (let i=0;i<L;i++){
+    diff |= (a[i] ^ b[i]);
+  }
+  return diff === 0;
+}
+
+function measureSync(fn, arg, trials=1000, warmup=200){
+  for (let i=0;i<warmup;i++) fn(arg);
+  const times = new Float64Array(trials);
+  for (let t=0;t<trials;t++){
+    const t0 = performance.now();
+    fn(arg);
+    const t1 = performance.now();
+    times[t] = t1 - t0;
+  }
+  return Array.from(times);
+}
+
+let CSV_ROWS = null;
+
+document.getElementById('run').addEventListener('click', ()=>{
+  (async ()=>{
+    logEl.textContent='';
+    const size = parseInt(document.getElementById('dim').value,10);
+    const trials = parseInt(document.getElementById('trials').value,10);
+    const warmup = parseInt(document.getElementById('warmup').value,10);
+    const jitterOn = document.getElementById('jitterOn').checked;
+    const jitterMag = parseInt(document.getElementById('jitterMag').value,10) || 0;
+
+    const levelsStr = document.getElementById('levels').value;
+    const levels = levelsStr.split(',').map(s=>parseFloat(s.trim())).filter(x=>!Number.isNaN(x));
+
+    log(`Generating base image ${size}x${size} (RGBA = ${size*size*4} bytes) ...`);
+    const base = makeRandomImageBytes(size);
+
+    const variants = levels.map(p => ({ pct: p, bytes: makeVariant(base, p) }));
+
+    const rows = [["variant_label","similarity_pct","algorithm","trial","elapsed_ms"]];
+    log(`Running experiments: ${trials} trials per (variant, algorithm) ...`);
+
+    for (const v of variants){
+      log(`Variant ${v.pct}% ...`);
+      const arg = [base, v.bytes];
+      const naiveFn = jitterOn ? (([a,b])=>naiveCompare(a,b,jitterMag)) : (([a,b])=>naiveCompare(a,b,0));
+      const constFn = (([a,b])=>constantCompare(a,b));
+
+      const tNaive = measureSync(naiveFn, arg, trials, warmup);
+      tNaive.forEach((ms,i)=>rows.push([`S${v.pct}`, v.pct, "naive", i, ms]));
+
+      const tConst = measureSync(constFn, arg, trials, warmup);
+      tConst.forEach((ms,i)=>rows.push([`S${v.pct}`, v.pct, "constant", i, ms]));
+
+      const mN = mean(tNaive).toFixed(4), mC = mean(tConst).toFixed(4);
+      log(`   naive mean=${mN} ms, constant mean=${mC} ms`);
+    }
+    CSV_ROWS = rows;
+    document.getElementById('download').disabled = false;
+    log('Done. Click "Download CSV" to save results.');
+  })();
+});
+
+document.getElementById('download').addEventListener('click', ()=>{
+  if (!CSV_ROWS) return;
+  const csv = toCSV(CSV_ROWS);
+  download('image_compare_timings.csv', csv);
+});
+</script>
+</body>
+</html>
